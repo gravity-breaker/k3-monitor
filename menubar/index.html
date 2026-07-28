@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "SF Pro Text", sans-serif;
+    color: #12354f;
+    padding: 18px 16px 18px;
+    -webkit-font-smoothing: antialiased;
+    user-select: none;
+    /* 蓝天 + 白云（纯 CSS 画的柔云团）；高度由内容决定，弹窗自动贴合 */
+    background:
+      radial-gradient(ellipse 300px 85px at 18% 10%, rgba(255,255,255,.95), transparent 70%),
+      radial-gradient(ellipse 190px 55px at 24% 12%, rgba(255,255,255,.9), transparent 65%),
+      radial-gradient(ellipse 280px 80px at 80% 26%, rgba(255,255,255,.8), transparent 70%),
+      radial-gradient(ellipse 340px 95px at 55% 82%, rgba(255,255,255,.75), transparent 70%),
+      linear-gradient(180deg, #5cb8f5 0%, #8fcbf8 38%, #c9e8fd 72%, #eaf7ff 100%);
+  }
+
+  /* ── 头部 ── */
+  .head { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  img.logo {
+    width: 34px; height: 34px; border-radius: 9px; flex: none;
+    box-shadow: 0 4px 12px -3px rgba(30,90,140,.35);
+    display: block;
+  }
+  .titles { flex: 1; }
+  .titles h1 { font-size: 16px; font-weight: 700; letter-spacing: .3px; }
+  .titles p { font-size: 11px; color: rgba(18,53,79,.55); margin-top: 2px; }
+  .live {
+    display: flex; align-items: center; gap: 5px;
+    background: rgba(255,255,255,.55); border: 1px solid rgba(16,185,129,.45);
+    color: #059669; font-size: 10.5px; font-weight: 600;
+    padding: 3px 9px; border-radius: 999px;
+  }
+  .live .dot { width: 6px; height: 6px; border-radius: 50%; background: #10b981;
+    animation: pulse 2s infinite; }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(16,185,129,.45); }
+    70% { box-shadow: 0 0 0 6px rgba(16,185,129,0); }
+    100% { box-shadow: 0 0 0 0 rgba(16,185,129,0); }
+  }
+
+  /* ── 卡片（白云玻璃感） ── */
+  .card {
+    background: rgba(255,255,255,.62);
+    -webkit-backdrop-filter: blur(14px);
+    backdrop-filter: blur(14px);
+    border: 1px solid rgba(255,255,255,.8);
+    border-radius: 14px;
+    padding: 14px 16px;
+    margin-bottom: 10px;
+    box-shadow: 0 4px 16px rgba(60,130,180,.10);
+  }
+  .card .k {
+    font-size: 11.5px; color: rgba(18,53,79,.58); display: flex; align-items: center; gap: 4px;
+  }
+  .card .row { display: flex; align-items: baseline; justify-content: space-between; margin-top: 6px; }
+  .card .v { font-size: 30px; font-weight: 750; font-variant-numeric: tabular-nums; letter-spacing: .5px; }
+  .card .cd { font-size: 11.5px; color: rgba(18,53,79,.55); font-variant-numeric: tabular-nums; }
+
+  .bar-track {
+    margin-top: 12px; height: 6px; border-radius: 999px;
+    background: rgba(255,255,255,.7); overflow: hidden;
+    box-shadow: inset 0 1px 2px rgba(60,130,180,.12);
+  }
+  .bar-fill {
+    height: 100%; border-radius: 999px;
+    background: linear-gradient(90deg, #4fc3f7, #1e88e5);
+    transition: width .8s cubic-bezier(.22,1,.36,1);
+  }
+  .bar-fill.warn { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
+  .bar-fill.crit { background: linear-gradient(90deg, #ef4444, #f87171); }
+
+  /* ── 双卡行 ── */
+  .duo { display: flex; gap: 10px; margin-bottom: 10px; }
+  .duo .card { flex: 1; margin-bottom: 0; }
+  .duo .v { font-size: 20px; margin-top: 6px; }
+  .duo .sub { font-size: 11px; color: rgba(18,53,79,.5); margin-top: 3px; }
+
+  .foot {
+    display: flex; justify-content: space-between;
+    font-size: 10.5px; color: rgba(18,53,79,.48); padding: 2px 4px 0;
+  }
+  .foot b { color: rgba(18,53,79,.72); font-weight: 600; }
+
+  .err {
+    display: none; margin-bottom: 10px; padding: 8px 12px; border-radius: 10px;
+    background: rgba(254,242,242,.85); border: 1px solid rgba(239,68,68,.35);
+    color: #b91c1c; font-size: 11px;
+  }
+</style>
+</head>
+<body>
+  <div class="head">
+    <img class="logo" src="kimi-icon.jpg" alt="Kimi">
+    <div class="titles">
+      <h1>K3 余量</h1>
+      <p id="updatedAt">正在读取…</p>
+    </div>
+    <div class="live"><span class="dot"></span>实时</div>
+  </div>
+
+  <div class="err" id="errBox"></div>
+
+  <div class="card">
+    <div class="k">本周用量</div>
+    <div class="row">
+      <div class="v" id="weekPct">--%</div>
+      <div class="cd" id="weekCd">--</div>
+    </div>
+    <div class="bar-track"><div class="bar-fill" id="weekBar" style="width:0%"></div></div>
+  </div>
+
+  <div class="card">
+    <div class="k">频限明细 · 5小时窗口</div>
+    <div class="row">
+      <div class="v" id="winPct">--%</div>
+      <div class="cd" id="winCd">--</div>
+    </div>
+    <div class="bar-track"><div class="bar-fill" id="winBar" style="width:0%"></div></div>
+  </div>
+
+  <div class="duo">
+    <div class="card">
+      <div class="k">我的权益</div>
+      <div class="v" id="plan">--</div>
+      <div class="sub">会员</div>
+    </div>
+    <div class="card">
+      <div class="k">模型权限</div>
+      <div class="v">K3</div>
+      <div class="sub">旗舰模型</div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <span>并发上限 <b id="parallel">--</b></span>
+    <span>api.kimi.com · 60s 自动刷新</span>
+  </div>
+
+<script>
+let resetWeek = null, resetWin = null, lastUpdate = 0;
+
+const PLAN_NAMES = {
+  LEVEL_ADVANCED: "Allegro",
+  LEVEL_BASIC: "Andante",
+  LEVEL_PRO: "Vivace",
+  LEVEL_FREE: "Free",
+  LEVEL_TEAM: "Team"
+};
+
+function planName(level) {
+  if (!level) return "--";
+  if (PLAN_NAMES[level]) return PLAN_NAMES[level];
+  return String(level).replace(/^LEVEL_/, "");
+}
+
+function countdown(iso) {
+  if (!iso) return "--";
+  const ms = new Date(iso) - Date.now();
+  if (isNaN(ms)) return "--";
+  if (ms <= 0) return "即将重置";
+  const s = Math.floor(ms / 1000);
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600),
+        m = Math.floor(s % 3600 / 60);
+  if (d > 0) return `${d}d ${h}h ${m}min后重置`;
+  if (h > 0) return `${h}h ${m}min后重置`;
+  if (m > 0) return `${m}min后重置`;
+  return `${s}s后重置`;
+}
+
+function ago() {
+  if (!lastUpdate) return "正在读取…";
+  const s = Math.max(0, Math.floor((Date.now() - lastUpdate) / 1000));
+  if (s < 8) return "刚刚更新";
+  if (s < 60) return `${s} 秒前更新`;
+  return `${Math.floor(s / 60)} 分钟前更新`;
+}
+
+function paint(el, bar, usedPct) {
+  el.textContent = usedPct + "%";
+  bar.style.width = usedPct + "%";
+  bar.className = "bar-fill" + (usedPct >= 90 ? " crit" : usedPct >= 70 ? " warn" : "");
+}
+
+window.updateData = function(d) {
+  try {
+    document.getElementById("errBox").style.display = "none";
+    lastUpdate = Date.now();
+
+    // 本周用量（已用%）
+    const limit = parseInt(d?.usage?.limit ?? 0, 10);
+    const rem = parseInt(d?.usage?.remaining ?? 0, 10);
+    const usedPct = limit > 0 ? Math.round((limit - rem) / limit * 100) : 0;
+    paint(document.getElementById("weekPct"), document.getElementById("weekBar"), usedPct);
+    resetWeek = d?.usage?.resetTime || null;
+
+    // 频限（5h 窗口，已用%）
+    const win = Array.isArray(d?.limits) ? d.limits[0] : null;
+    if (win && win.detail) {
+      const wl = parseInt(win.detail.limit ?? 0, 10);
+      const wu = parseInt(win.detail.used ?? 0, 10);
+      const wp = wl > 0 ? Math.round(wu / wl * 100) : 0;
+      paint(document.getElementById("winPct"), document.getElementById("winBar"), wp);
+      resetWin = win.detail.resetTime || null;
+    }
+
+    document.getElementById("plan").textContent = planName(d?.user?.membership?.level);
+    document.getElementById("parallel").textContent = d?.parallel?.limit ?? "--";
+  } catch (e) {
+    window.showError("数据解析异常: " + e.message);
+  }
+};
+
+window.showError = function(msg) {
+  const b = document.getElementById("errBox");
+  b.style.display = "block";
+  b.textContent = "刷新失败：" + msg;
+};
+
+setInterval(() => {
+  document.getElementById("weekCd").textContent = countdown(resetWeek);
+  document.getElementById("winCd").textContent = countdown(resetWin);
+  document.getElementById("updatedAt").textContent = ago();
+}, 1000);
+</script>
+</body>
+</html>
