@@ -115,6 +115,35 @@
     background: #fef2f2; border: 1px solid #fecaca; color: #b91c1c; font-size: 11.5px;
   }
   .foot { margin-top: 14px; text-align: center; font-size: 10.5px; color: #a9b8c1; }
+
+  /* ── 月额度池 ── */
+  .month {
+    margin-top: 16px; padding-top: 14px;
+    border-top: 1px dashed #dde7ec;
+  }
+  .month-head { display: flex; justify-content: space-between; align-items: baseline; }
+  .month-title { font-size: 13px; font-weight: 700; color: #33475a; }
+  .month-title em { font-style: normal; font-size: 10.5px; color: #94a3ad; font-weight: 500; margin-left: 4px; }
+  .month-pct { font-size: 17px; font-weight: 800; color: #16283a; font-variant-numeric: tabular-nums; }
+  .month-pct small { font-size: 10.5px; color: #8b9aa5; font-weight: 500; margin-left: 3px; }
+  .month-track { position: relative; margin-top: 10px; height: 9px; border-radius: 999px;
+    background: #e3ebef; overflow: hidden; box-shadow: inset 0 1px 2px rgba(20,50,70,.08); }
+  .month-track .seg { position: absolute; top: 0; height: 100%;
+    transition: width .8s cubic-bezier(.22,1,.36,1), left .8s cubic-bezier(.22,1,.36,1); }
+  .seg-code { left: 0; background: linear-gradient(90deg, #60a5fa, #3b82f6);
+    border-radius: 999px 0 0 999px; }
+  .seg-kimi { background: linear-gradient(90deg, #b6c2cc, #94a5b3); }
+  .month-legend { display: flex; gap: 14px; margin-top: 7px; font-size: 10.5px; color: #8b9aa5; }
+  .month-legend i { display: inline-block; width: 8px; height: 8px; border-radius: 3px; margin-right: 4px; vertical-align: -1px; }
+  .month-legend .lc { background: #3b82f6; }
+  .month-legend .lk { background: #9aa9b6; }
+  .month-meta { display: flex; justify-content: space-between; margin-top: 8px;
+    font-size: 11.5px; color: #8b9aa5; }
+  .month-meta b { color: #5c6f7b; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .m-notice {
+    display: none; margin-top: 10px; padding: 7px 12px; border-radius: 10px;
+    background: #fffbeb; border: 1px solid #fde68a; color: #b45309; font-size: 11.5px; font-weight: 600;
+  }
 </style>
 </head>
 <body>
@@ -167,8 +196,28 @@
       <span>并发上限 <b id="parallel">--</b></span>
     </div>
 
+    <div class="month">
+      <div class="month-head">
+        <span class="month-title">月总额度<em>全功能共享池</em></span>
+        <span class="month-pct"><b id="mUsedPct">--</b>%<small>已用</small></span>
+      </div>
+      <div class="month-track">
+        <div class="seg seg-code" id="mCode" style="width:0%"></div>
+        <div class="seg seg-kimi" id="mKimi" style="left:0%;width:0%"></div>
+      </div>
+      <div class="month-legend">
+        <span><i class="lc"></i>Code <span id="mCodePct">--</span></span>
+        <span><i class="lk"></i>Kimi <span id="mKimiPct">--</span></span>
+      </div>
+      <div class="month-meta">
+        <span><b id="mReset">--</b> 后重置</span>
+        <span>赠送额度剩 <b id="mGift">--</b></span>
+      </div>
+      <div class="m-notice" id="mNotice"></div>
+    </div>
+
     <div class="err" id="errBox"></div>
-    <div class="foot">数据源 api.kimi.com/coding · 每 30 秒自动刷新</div>
+    <div class="foot">数据源 api.kimi.com/coding + kimi.com 订阅 · 每 30 秒自动刷新</div>
   </div>
 
 <script>
@@ -192,6 +241,12 @@ function planName(level) {
   const map = { LEVEL_ADVANCED: "ADVANCED", LEVEL_BASIC: "BASIC",
                 LEVEL_PRO: "PRO", LEVEL_FREE: "FREE", LEVEL_TEAM: "TEAM" };
   return map[level] || String(level).replace(/^LEVEL_/, "");
+}
+function fmtDate(iso) {
+  if (!iso) return "--";
+  const d = new Date(iso);
+  if (isNaN(d)) return "--";
+  return `${d.getMonth()+1}月${d.getDate()}日`;
 }
 function agoText(ts) {
   const s = Math.max(0, Math.floor(Date.now()/1000 - ts));
@@ -246,6 +301,47 @@ async function refresh() {
     errBox.style.display = "block";
     errBox.textContent = "读取失败：" + e.message;
     document.getElementById("updatedAt").textContent = "连接失败";
+  }
+  refreshMonthly();
+}
+
+async function refreshMonthly() {
+  const notice = document.getElementById("mNotice");
+  try {
+    const r = await fetch("/api/monthly", { cache: "no-store" });
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error || "无数据");
+
+    const d = j.data;
+    const used = Math.round((d.used_ratio ?? 0) * 1000) / 10;
+    const code = Math.round((d.code_ratio ?? 0) * 1000) / 10;
+    const kimi = Math.max(0, Math.round((used - code) * 10) / 10);
+
+    document.getElementById("mUsedPct").textContent = used;
+    document.getElementById("mCode").style.width = code + "%";
+    const kimiSeg = document.getElementById("mKimi");
+    kimiSeg.style.left = code + "%";
+    kimiSeg.style.width = kimi + "%";
+    document.getElementById("mCodePct").textContent = code + "%";
+    document.getElementById("mKimiPct").textContent = kimi + "%";
+    document.getElementById("mReset").textContent = fmtDate(d.reset_at);
+
+    if (d.gift) {
+      const left = Math.round((1 - (d.gift.used_ratio ?? 0)) * 100);
+      document.getElementById("mGift").textContent = `${left}%（${fmtDate(d.gift.expire)}到期）`;
+    } else {
+      document.getElementById("mGift").textContent = "无";
+    }
+
+    if ((d.used_ratio ?? 0) >= 1 && d.notice) {
+      notice.style.display = "block";
+      notice.textContent = "月度池已用完，正在消耗赠送额度";
+    } else {
+      notice.style.display = "none";
+    }
+  } catch (e) {
+    notice.style.display = "block";
+    notice.textContent = "月额度读取失败：" + e.message;
   }
 }
 

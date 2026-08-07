@@ -7,3 +7,5 @@ kimi-icon.jpg
 __pycache__/
 .DS_Store
 *.log
+# Kimi 网页端登录态（敏感，绝不入库）
+.kimi-web-token.json
