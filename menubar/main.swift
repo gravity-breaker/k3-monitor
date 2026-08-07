@@ -8,6 +8,14 @@ let CONFIG_PATH = NSHomeDirectory() + "/.hermes/config.yaml"
 let USAGE_URL = "https://api.kimi.com/coding/v1/usages"
 let LOG_PATH = NSHomeDirectory() + "/Library/Logs/k3monitorbar.log"
 
+// ── 月度额度池（kimi.com 订阅页 GetSubscriptionStats）──
+// 登录态与网页版监控共用 ~/Applications/k3-monitor/.kimi-web-token.json；
+// 读不到/过期时回读 Kimi 桌面端 Local Storage(leveldb)，末位才自助刷新。
+let STATS_URL = "https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats"
+let REFRESH_URL = "https://www.kimi.com/api/auth/token/refresh"
+let WEB_TOKEN_PATH = NSHomeDirectory() + "/Applications/k3-monitor/.kimi-web-token.json"
+let LEVELDB_DIR = NSHomeDirectory() + "/Library/Application Support/kimi-desktop/Local Storage/leveldb"
+
 func log(_ s: String) {
     let line = "\(ISO8601DateFormatter().string(from: Date())) \(s)\n"
     if let h = FileHandle(forWritingAtPath: LOG_PATH) {
@@ -29,12 +37,85 @@ func readAPIKey() -> String? {
     return String(txt[r])
 }
 
+// ── 网页端 token：文件优先，leveldb 回读，自助刷新兜底 ──
+func jwtClaims(_ token: String) -> [String: Any]? {
+    let parts = token.split(separator: ".")
+    guard parts.count >= 2 else { return nil }
+    var payload = String(parts[1]).replacingOccurrences(of: "-", with: "+")
+        .replacingOccurrences(of: "_", with: "/")
+    while payload.count % 4 != 0 { payload += "=" }
+    guard let data = Data(base64Encoded: payload) else { return nil }
+    return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+}
+
+func jwtExp(_ token: String) -> Double {
+    (jwtClaims(token)?["exp"] as? Double) ?? 0
+}
+
+/// 从 Kimi 桌面端 leveldb 扫 JWT：access≈30 天、refresh≈90 天，各取 iat 最新
+func extractTokensFromLeveldb() -> [String: String]? {
+    guard let files = try? FileManager.default.contentsOfDirectory(atPath: LEVELDB_DIR) else { return nil }
+    let paths = files.filter { $0.hasSuffix(".log") || $0.hasSuffix(".ldb") }
+        .map { LEVELDB_DIR + "/" + $0 }
+        .sorted { (a, b) in
+            let ma = (try? FileManager.default.attributesOfItem(atPath: a))?[.modificationDate] as? Date ?? .distantPast
+            let mb = (try? FileManager.default.attributesOfItem(atPath: b))?[.modificationDate] as? Date ?? .distantPast
+            return ma > mb
+        }
+    guard let re = try? NSRegularExpression(pattern: #"eyJhbGciOiJI[A-Za-z0-9_.\-]+"#) else { return nil }
+    var bestAccess: (Double, String)?; var bestRefresh: (Double, String)?
+    let now = Date().timeIntervalSince1970
+    for p in paths {
+        guard let blob = try? String(contentsOfFile: p, encoding: .isoLatin1) else { continue }
+        let ns = blob as NSString
+        for m in re.matches(in: blob, range: NSRange(location: 0, length: ns.length)) {
+            let tok = ns.substring(with: m.range)
+            guard let c = jwtClaims(tok),
+                  let iat = c["iat"] as? Double, let exp = c["exp"] as? Double,
+                  exp > now else { continue }
+            if exp - iat <= 40 * 86400 {
+                if bestAccess == nil || iat > bestAccess!.0 { bestAccess = (iat, tok) }
+            } else {
+                if bestRefresh == nil || iat > bestRefresh!.0 { bestRefresh = (iat, tok) }
+            }
+        }
+    }
+    guard let a = bestAccess, let r = bestRefresh else { return nil }
+    return ["access_token": a.1, "refresh_token": r.1]
+}
+
+func saveWebTokens(_ tok: [String: String]) {
+    if let data = try? JSONSerialization.data(withJSONObject: tok) {
+        try? data.write(to: URL(fileURLWithPath: WEB_TOKEN_PATH))
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600],
+                                               ofItemAtPath: WEB_TOKEN_PATH)
+    }
+}
+
+func loadWebTokens() -> [String: String]? {
+    var tok: [String: String]? = nil
+    if let data = try? Data(contentsOf: URL(fileURLWithPath: WEB_TOKEN_PATH)),
+       let j = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
+        tok = j
+    }
+    if let t = tok, let acc = t["access_token"], jwtExp(acc) > Date().timeIntervalSince1970 + 3600 {
+        return t
+    }
+    if let fresh = extractTokensFromLeveldb() {
+        saveWebTokens(fresh)
+        return fresh
+    }
+    return tok
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     var statusItem: NSStatusItem!
     var popover: NSPopover!
     var webView: WKWebView!
     var refreshTimer: Timer?
     var lastJSON: String = ""
+    var lastMonthlyJSON: String = ""
+    var lastMonthlyFetch = Date.distantPast
     var pageReady = false
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -85,6 +166,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         pageReady = true
         if !lastJSON.isEmpty { push(lastJSON) }
+        if !lastMonthlyJSON.isEmpty { pushMonthly(lastMonthlyJSON) }
         fitHeight()
     }
 
@@ -125,10 +207,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
             popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
             NSApp.activate(ignoringOtherApps: true)
             if pageReady, !lastJSON.isEmpty { push(lastJSON) }
+            if pageReady, !lastMonthlyJSON.isEmpty { pushMonthly(lastMonthlyJSON) }
         }
     }
 
     func fetch() {
+        if Date().timeIntervalSince(lastMonthlyFetch) > 300 { fetchMonthly() }
         guard let key = readAPIKey() else {
             log("ERROR: 读不到 kimi-coding api_key")
             pushError("读不到 ~/.hermes/config.yaml 里的 kimi-coding key")
@@ -182,6 +266,121 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
               let arr = String(data: data, encoding: .utf8) else { return }
         let inner = String(arr.dropFirst().dropLast())
         webView.evaluateJavaScript("window.showError && window.showError(\(inner))", completionHandler: nil)
+    }
+
+    // ── 月度额度池 ──
+    func fetchMonthly() {
+        lastMonthlyFetch = Date()
+        guard let tok = loadWebTokens(), let acc = tok["access_token"] else {
+            log("monthly ERROR: 找不到网页端登录态")
+            return
+        }
+        callStats(access: acc) { [weak self] status, obj in
+            guard let self = self else { return }
+            if status == 200, let obj = obj {
+                self.handleMonthly(obj)
+                return
+            }
+            // 401/失败：先回读 App leveldb（App 是主刷新者），不行再自助刷新
+            let fresh = self.extractAndCompare(current: acc)
+            if let fresh = fresh {
+                self.callStats(access: fresh["access_token"]!) { st2, obj2 in
+                    if st2 == 200, let obj2 = obj2 { self.handleMonthly(obj2) }
+                    else { self.refreshAndRetry(tok: fresh) }
+                }
+            } else {
+                self.refreshAndRetry(tok: tok)
+            }
+        }
+    }
+
+    func extractAndCompare(current acc: String) -> [String: String]? {
+        guard let fresh = extractTokensFromLeveldb(),
+              fresh["access_token"] != acc else { return nil }
+        saveWebTokens(fresh)
+        return fresh
+    }
+
+    func refreshAndRetry(tok: [String: String]) {
+        guard let rt = tok["refresh_token"] else {
+            log("monthly ERROR: 无 refresh_token")
+            return
+        }
+        var req = URLRequest(url: URL(string: REFRESH_URL)!)
+        req.setValue("Bearer \(rt)", forHTTPHeaderField: "Authorization")
+        req.timeoutInterval = 15
+        let conf = URLSessionConfiguration.ephemeral
+        conf.connectionProxyDictionary = [:]
+        URLSession(configuration: conf).dataTask(with: req) { [weak self] data, resp, err in
+            guard let self = self else { return }
+            guard let data = data,
+                  (resp as? HTTPURLResponse)?.statusCode == 200,
+                  let j = try? JSONSerialization.jsonObject(with: data) as? [String: String],
+                  let acc = j["access_token"], j["refresh_token"] != nil else {
+                log("monthly ERROR: token 刷新失败 \(err?.localizedDescription ?? "")")
+                return
+            }
+            saveWebTokens(j)
+            log("monthly: token 自助刷新成功")
+            self.callStats(access: acc) { st, obj in
+                if st == 200, let obj = obj { self.handleMonthly(obj) }
+                else { log("monthly ERROR: 刷新后仍 \(st)") }
+            }
+        }.resume()
+    }
+
+    func callStats(access: String, completion: @escaping (Int, [String: Any]?) -> Void) {
+        var req = URLRequest(url: URL(string: STATS_URL)!)
+        req.httpMethod = "POST"
+        req.httpBody = "{}".data(using: .utf8)
+        req.setValue("Bearer \(access)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 15
+        let conf = URLSessionConfiguration.ephemeral
+        conf.connectionProxyDictionary = [:]   // kimi.com 国内直连
+        URLSession(configuration: conf).dataTask(with: req) { data, resp, err in
+            let st = (resp as? HTTPURLResponse)?.statusCode ?? -1
+            guard let data = data, err == nil,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                DispatchQueue.main.async { completion(st == 0 ? -1 : st, nil) }
+                return
+            }
+            DispatchQueue.main.async { completion(st, obj) }
+        }.resume()
+    }
+
+    func handleMonthly(_ raw: [String: Any]) {
+        let bal = raw["subscriptionBalance"] as? [String: Any] ?? [:]
+        var out: [String: Any] = [
+            "used_ratio": bal["amountUsedRatio"] ?? 0,
+            "code_ratio": bal["kimiCodeUsedRatio"] ?? 0,
+            "reset_at": bal["expireTime"] ?? "",
+        ]
+        if let gifts = raw["giftBalances"] as? [[String: Any]], let g = gifts.first {
+            out["gift"] = [
+                "used_ratio": g["amountUsedRatio"] ?? 0,
+                "expire": g["expireTime"] ?? "",
+            ]
+        }
+        if let notice = (raw["notice"] as? [String: Any])?["content"] as? String {
+            out["notice"] = notice
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: out),
+              let json = String(data: data, encoding: .utf8) else { return }
+        let used = ((bal["amountUsedRatio"] as? Double) ?? 0) * 100
+        log(String(format: "monthly OK used=%.1f%%", used))
+        DispatchQueue.main.async {
+            self.lastMonthlyJSON = json
+            self.pushMonthly(json)
+        }
+    }
+
+    func pushMonthly(_ json: String) {
+        guard pageReady else { return }
+        webView.evaluateJavaScript("window.updateMonthly && window.updateMonthly(\(json))") { [weak self] _, e in
+            if let e = e { log("monthly JS error: \(e.localizedDescription)") }
+            self?.fitHeight()
+        }
     }
 
     // ── 菜单栏图标：剩余%圆环 + 数字 ──

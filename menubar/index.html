@@ -74,6 +74,28 @@
   .bar-fill.warn { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
   .bar-fill.crit { background: linear-gradient(90deg, #ef4444, #f87171); }
 
+  /* ── 月额度池分段条 ── */
+  .month-track { position: relative; }
+  .mseg { position: absolute; top: 0; height: 100%;
+    transition: width .8s cubic-bezier(.22,1,.36,1), left .8s cubic-bezier(.22,1,.36,1); }
+  .mcode { left: 0; background: linear-gradient(90deg, #4fc3f7, #1e88e5); }
+  .mkimi { background: linear-gradient(90deg, #b6c2cc, #94a5b3); }
+  .mlegend {
+    display: flex; gap: 12px; align-items: center; margin-top: 8px;
+    font-size: 10.5px; color: rgba(18,53,79,.55);
+  }
+  .mlegend i { display: inline-block; width: 7px; height: 7px; border-radius: 2.5px;
+    margin-right: 3px; vertical-align: -0.5px; }
+  .mlegend .lc { background: #1e88e5; }
+  .mlegend .lk { background: #9aa9b6; }
+  .mlegend .right { margin-left: auto; }
+  .mlegend b { color: rgba(18,53,79,.72); font-weight: 600; }
+  .mnotice {
+    display: none; margin-top: 9px; padding: 6px 10px; border-radius: 8px;
+    background: rgba(255,251,235,.92); border: 1px solid rgba(245,158,11,.4);
+    color: #b45309; font-size: 11px; font-weight: 600;
+  }
+
   /* ── 双卡行 ── */
   .duo { display: flex; gap: 10px; margin-bottom: 10px; }
   .duo .card { flex: 1; margin-bottom: 0; }
@@ -115,6 +137,24 @@
   </div>
 
   <div class="card">
+    <div class="k">月总额度 · 全功能共享池</div>
+    <div class="row">
+      <div class="v" id="monthPct">--%</div>
+      <div class="cd" id="monthCd">--</div>
+    </div>
+    <div class="bar-track month-track">
+      <div class="mseg mcode" id="mCode" style="width:0%"></div>
+      <div class="mseg mkimi" id="mKimi" style="left:0%;width:0%"></div>
+    </div>
+    <div class="mlegend">
+      <span><i class="lc"></i>Code <b id="mCodePct">--</b></span>
+      <span><i class="lk"></i>Kimi <b id="mKimiPct">--</b></span>
+      <span class="right">赠送剩 <b id="mGift">--</b></span>
+    </div>
+    <div class="mnotice" id="mNotice">月度池已用完，正在消耗赠送额度</div>
+  </div>
+
+  <div class="card">
     <div class="k">频限明细 · 5小时窗口</div>
     <div class="row">
       <div class="v" id="winPct">--%</div>
@@ -142,7 +182,7 @@
   </div>
 
 <script>
-let resetWeek = null, resetWin = null, lastUpdate = 0;
+let resetWeek = null, resetWin = null, resetMonth = null, lastUpdate = 0;
 
 const PLAN_NAMES = {
   LEVEL_ADVANCED: "Allegro",
@@ -221,9 +261,45 @@ window.showError = function(msg) {
   b.textContent = "刷新失败：" + msg;
 };
 
+function fmtDate(iso) {
+  if (!iso) return "--";
+  const d = new Date(iso);
+  if (isNaN(d)) return "--";
+  return `${d.getMonth()+1}月${d.getDate()}日`;
+}
+
+window.updateMonthly = function(d) {
+  try {
+    const used = Math.round((d.used_ratio ?? 0) * 1000) / 10;
+    const code = Math.round((d.code_ratio ?? 0) * 1000) / 10;
+    const kimi = Math.max(0, Math.round((used - code) * 10) / 10);
+
+    document.getElementById("monthPct").textContent = used + "%";
+    document.getElementById("mCode").style.width = code + "%";
+    const ks = document.getElementById("mKimi");
+    ks.style.left = code + "%";
+    ks.style.width = kimi + "%";
+    document.getElementById("mCodePct").textContent = code + "%";
+    document.getElementById("mKimiPct").textContent = kimi + "%";
+    resetMonth = d.reset_at || null;
+
+    if (d.gift) {
+      const left = Math.round((1 - (d.gift.used_ratio ?? 0)) * 100);
+      document.getElementById("mGift").textContent = `${left}%（${fmtDate(d.gift.expire)}到期）`;
+    } else {
+      document.getElementById("mGift").textContent = "无";
+    }
+    document.getElementById("mNotice").style.display =
+      ((d.used_ratio ?? 0) >= 1 && d.notice) ? "block" : "none";
+  } catch (e) {
+    window.showError("月额度解析异常: " + e.message);
+  }
+};
+
 setInterval(() => {
   document.getElementById("weekCd").textContent = countdown(resetWeek);
   document.getElementById("winCd").textContent = countdown(resetWin);
+  document.getElementById("monthCd").textContent = countdown(resetMonth);
   document.getElementById("updatedAt").textContent = ago();
 }, 1000);
 </script>
