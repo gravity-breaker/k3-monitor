@@ -310,6 +310,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         animTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             self?.tickLight()
         }
+
+        // 录制遥控：分布式通知 k3.rc.popover / k3.rc.close / k3.rc.menu
+        let dnc = DistributedNotificationCenter.default()
+        dnc.addObserver(self, selector: #selector(rcPopoverOpen),  name: NSNotification.Name("k3.rc.popover"), object: nil)
+        dnc.addObserver(self, selector: #selector(rcPopoverClose), name: NSNotification.Name("k3.rc.close"),   object: nil)
+        dnc.addObserver(self, selector: #selector(rcMenuOpen),     name: NSNotification.Name("k3.rc.menu"),    object: nil)
+        dnc.addObserver(self, selector: #selector(rcRedFlash),     name: NSNotification.Name("k3.rc.redflash"), object: nil)
+
+        // DEMO 模式（K3_DEMO=1 手动运行）：自动演示 弹窗 8s → 菜单 6s，供真实录屏用
+        if ProcessInfo.processInfo.environment["K3_DEMO"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                guard let self = self else { return }
+                self.togglePopover()                           // 弹窗开
+                DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) {
+                    self.popover.performClose(nil)             // 弹窗关
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                        self.showContextMenu()                 // 菜单开
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) {
+                            NSApp.terminate(nil)               // 演示结束退出
+                        }
+                    }
+                }
+            }
+        }
+
         // 睡眠唤醒后立即刷新
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(onWake),
@@ -360,6 +385,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
                     return
                 }
                 self.hermesRows = rows
+                if Date() < self.demoHoldUntil { return }   // 演示红闪期间不被轮询覆盖
                 if rows.contains(where: { $0.status == "waiting" }) {
                     self.lightState = .waiting
                 } else if rows.contains(where: { $0.status == "working" || $0.status == "starting" }) {
@@ -401,11 +427,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
 
     @objc func statusClicked(_ sender: NSStatusBarButton) {
         guard let event = NSApp.currentEvent else { return }
-        if event.type == .rightMouseUp {
-            let menu = NSMenu()
-            let head = NSMenuItem(title: "Hermes：\(lightState.rawValue)", action: nil, keyEquivalent: "")
-            head.isEnabled = false
-            menu.addItem(head)
+        if event.type == .rightMouseUp { showContextMenu() } else { togglePopover() }
+    }
+
+    // ── 录制遥控：分布式通知驱动弹窗/菜单（供录屏脚本调用）──
+    @objc func rcPopoverOpen()  { if !popover.isShown { togglePopover() } }
+    @objc func rcPopoverClose() { if popover.isShown { popover.performClose(nil) } }
+    @objc func rcMenuOpen()     { showContextMenu() }
+    var demoHoldUntil = Date.distantPast
+    @objc func rcRedFlash() {   // 演示红闪：强制 waiting 态 12 秒（真实渲染路径）
+        demoHoldUntil = Date().addingTimeInterval(12)
+        lightState = .waiting
+    }
+
+    func showContextMenu() {
+        let menu = NSMenu()
+        let head = NSMenuItem(title: "Hermes：\(lightState.rawValue)", action: nil, keyEquivalent: "")
+        head.isEnabled = false
+        menu.addItem(head)
             if hermesRows.isEmpty {
                 let it = NSMenuItem(title: lightState == .off ? "  后端未运行" : "  无活动会话",
                                     action: nil, keyEquivalent: "")
@@ -428,9 +467,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
             statusItem.menu = menu
             statusItem.button?.performClick(nil)
             statusItem.menu = nil   // 恢复左键弹窗
-        } else {
-            togglePopover()
-        }
     }
 
     @objc func manualRefresh() { fetch() }
