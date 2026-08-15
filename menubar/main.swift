@@ -108,15 +108,167 @@ func loadWebTokens() -> [String: String]? {
     return tok
 }
 
+// ── Hermes 状态灯（红黄绿环，合并自 hermes-light 2026-08-15）──
+// 圆环颜色编码 Hermes 后端状态：绿=全部空闲 黄呼吸=工作中 红闪=待确认 灰=后端未运行
+// 信号源：hermes_cli.main serve 的 WS JSON-RPC session.active_list（2s 轮询）
+enum LightState: String {
+    case off = "未运行"
+    case idle = "空闲"
+    case working = "工作中"
+    case waiting = "待确认"
+}
+
+struct SessionRow {
+    let key: String
+    let title: String
+    let preview: String
+    let status: String
+
+    var displayName: String {
+        let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !t.isEmpty { return t }
+        let p = preview.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !p.isEmpty { return p }
+        return key
+    }
+    var statusCN: String {
+        switch status {
+        case "waiting": return "待确认"
+        case "working": return "工作中"
+        case "starting": return "启动中"
+        default: return "空闲"
+        }
+    }
+}
+
+func ellipsize(_ s: String, maxWidth: Int) -> String {
+    var w = 0, out = ""
+    for ch in s {
+        let cw = ch.isASCII ? 1 : 2
+        if w + cw > maxWidth { return out + "…" }
+        w += cw; out.append(ch)
+    }
+    return out
+}
+
+func shellOut(_ launch: String, _ args: [String]) -> String {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: launch)
+    p.arguments = args
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    do { try p.run() } catch { return "" }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return String(data: data, encoding: .utf8) ?? ""
+}
+
+/// 发现 Hermes 桌面端后端：pid ← ps；token ← 进程 env；port ← lsof 监听口
+func discoverBackend() -> (port: String, token: String)? {
+    let ps = shellOut("/bin/ps", ["aux"])
+    var pid: String?
+    for line in ps.split(separator: "\n") {
+        if line.contains("hermes_cli.main serve") && !line.contains("grep") {
+            let cols = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
+            if cols.count > 1 { pid = String(cols[1]); break }
+        }
+    }
+    guard let pid else { return nil }
+    let env = shellOut("/bin/ps", ["eww", pid])
+    var token: String?
+    for field in env.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" }) {
+        if field.hasPrefix("HERMES_DASHBOARD_SESSION_TOKEN=") {
+            token = String(field.dropFirst("HERMES_DASHBOARD_SESSION_TOKEN=".count))
+            break
+        }
+    }
+    guard let token, !token.isEmpty else { return nil }
+    let lsof = shellOut("/usr/sbin/lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", pid])
+    for line in lsof.split(separator: "\n") {
+        guard line.contains("127.0.0.1:") else { continue }
+        if let r = line.range(of: #"127\.0\.0\.1:(\d+)"#, options: .regularExpression) {
+            return (String(line[r]).replacingOccurrences(of: "127.0.0.1:", with: ""), token)
+        }
+    }
+    return nil
+}
+
+/// 一次 WS 轮询 session.active_list；失败回 nil
+func pollOnce(port: String, token: String, completion: @escaping ([SessionRow]?) -> Void) {
+    var comps = URLComponents(string: "ws://127.0.0.1:\(port)/api/ws")!
+    comps.queryItems = [URLQueryItem(name: "token", value: token)]
+    guard let url = comps.url else { completion(nil); return }
+    let conf = URLSessionConfiguration.ephemeral
+    conf.connectionProxyDictionary = [:]
+    let ws = URLSession(configuration: conf).webSocketTask(with: url)
+    ws.resume()
+    var done = false
+    func finish(_ rows: [SessionRow]?) {
+        if done { return }
+        done = true
+        ws.cancel()
+        completion(rows)
+    }
+    DispatchQueue.global().asyncAfter(deadline: .now() + 5) { finish(nil) }
+    let req = #"{"jsonrpc":"2.0","id":1,"method":"session.active_list","params":{}}"# + "\n"
+    ws.send(.string(req)) { err in if err != nil { finish(nil) } }
+    func receive() {
+        ws.receive { result in
+            switch result {
+            case .failure:
+                finish(nil)
+            case .success(let msg):
+                let text: String
+                switch msg {
+                case .string(let s): text = s
+                case .data(let d): text = String(data: d, encoding: .utf8) ?? ""
+                @unknown default: text = ""
+                }
+                for line in text.split(separator: "\n") {
+                    guard let data = line.data(using: .utf8),
+                          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          let idv = obj["id"] as? Int, idv == 1,
+                          let res = obj["result"] as? [String: Any],
+                          let sessions = res["sessions"] as? [[String: Any]]
+                    else { continue }
+                    finish(sessions.map { s in
+                        SessionRow(
+                            key: String(s["session_key"] as? String ?? s["id"] as? String ?? ""),
+                            title: String(s["title"] as? String ?? ""),
+                            preview: String(s["preview"] as? String ?? ""),
+                            status: String(s["status"] as? String ?? "idle"))
+                    })
+                    return
+                }
+                if !done { receive() }
+            }
+        }
+    }
+    receive()
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     var statusItem: NSStatusItem!
     var popover: NSPopover!
     var webView: WKWebView!
     var refreshTimer: Timer?
+    var animTimer: Timer?
     var lastJSON: String = ""
     var lastMonthlyJSON: String = ""
     var lastMonthlyFetch = Date.distantPast
     var pageReady = false
+    // ── 状态灯 ──
+    var lightState: LightState = .off { didSet { if oldValue != lightState {
+        log("light -> \(lightState.rawValue)"); lastAlpha = -1; renderRing() } } }
+    var hermesRows: [SessionRow] = []
+    var backend: (port: String, token: String)?
+    var lastHermesPoll = Date.distantPast
+    var lastDiscover = Date.distantPast
+    var hermesPollInFlight = false
+    var phase: Double = 0
+    var lastAlpha: CGFloat = -1
+    var lastPct: Int = 0
 
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -154,6 +306,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.fetch()
         }
+        // 状态灯动画 + 2s 轮询节拍器
+        animTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            self?.tickLight()
+        }
         // 睡眠唤醒后立即刷新
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(onWake),
@@ -161,7 +317,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         log("app started")
     }
 
-    @objc func onWake() { fetch() }
+    @objc func onWake() { fetch(); lastHermesPoll = .distantPast }
+
+    // ── 状态灯节拍：动画 + 节流轮询 ──
+    func tickLight() {
+        phase += 0.1
+        switch lightState {
+        case .working:
+            renderRing(alpha: 0.35 + 0.65 * CGFloat(0.5 - 0.5 * cos(2 * Double.pi * phase / 1.6)))
+        case .waiting:
+            renderRing(alpha: Int(phase * 2) % 2 == 0 ? 1.0 : 0.15)
+        default:
+            renderRing(alpha: 1.0)
+        }
+        if !hermesPollInFlight && Date().timeIntervalSince(lastHermesPoll) > 2 {
+            hermesPollInFlight = true
+            lastHermesPoll = Date()
+            pollHermes()
+        }
+    }
+
+    func pollHermes() {
+        if backend == nil && Date().timeIntervalSince(lastDiscover) > 5 {
+            lastDiscover = Date()
+            backend = discoverBackend()
+            if backend != nil { log("hermes backend port=\(backend!.port)") }
+        }
+        guard let b = backend else {
+            DispatchQueue.main.async {
+                self.lightState = .off; self.hermesRows = []; self.hermesPollInFlight = false
+            }
+            return
+        }
+        pollOnce(port: b.port, token: b.token) { [weak self] rows in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.hermesPollInFlight = false
+                guard let rows = rows else {
+                    self.backend = nil   // 连接失败：下轮重新发现（后端重启换端口/token）
+                    self.lightState = .off
+                    self.hermesRows = []
+                    return
+                }
+                self.hermesRows = rows
+                if rows.contains(where: { $0.status == "waiting" }) {
+                    self.lightState = .waiting
+                } else if rows.contains(where: { $0.status == "working" || $0.status == "starting" }) {
+                    self.lightState = .working
+                } else {
+                    self.lightState = .idle
+                }
+            }
+        }
+    }
+
+    // ── 圆环重绘：K3 剩余%弧线 + Hermes 状态颜色/呼吸/闪烁 ──
+    func renderRing(alpha: CGFloat = 1.0) {
+        if abs(alpha - lastAlpha) < 0.02 { return }
+        lastAlpha = alpha
+        guard let b = statusItem.button else { return }
+        b.image = ringImage(pct: lastPct, alpha: alpha)
+        b.imagePosition = .imageLeft
+        b.title = " \(lastPct)%"
+    }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         pageReady = true
@@ -185,6 +403,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         guard let event = NSApp.currentEvent else { return }
         if event.type == .rightMouseUp {
             let menu = NSMenu()
+            let head = NSMenuItem(title: "Hermes：\(lightState.rawValue)", action: nil, keyEquivalent: "")
+            head.isEnabled = false
+            menu.addItem(head)
+            if hermesRows.isEmpty {
+                let it = NSMenuItem(title: lightState == .off ? "  后端未运行" : "  无活动会话",
+                                    action: nil, keyEquivalent: "")
+                it.isEnabled = false
+                menu.addItem(it)
+            } else {
+                for r in hermesRows {
+                    let mark = r.status == "waiting" ? "🔴" : (r.status == "working" || r.status == "starting") ? "🟡" : "🟢"
+                    let it = NSMenuItem(
+                        title: "\(mark) \(ellipsize(r.displayName, maxWidth: 30)) — \(r.statusCN)",
+                        action: nil, keyEquivalent: "")
+                    it.isEnabled = false
+                    menu.addItem(it)
+                }
+            }
+            menu.addItem(.separator())
             menu.addItem(NSMenuItem(title: "立即刷新", action: #selector(manualRefresh), keyEquivalent: ""))
             menu.addItem(.separator())
             menu.addItem(NSMenuItem(title: "退出 K3 余量", action: #selector(quitApp), keyEquivalent: "q"))
@@ -383,24 +620,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         }
     }
 
-    // ── 菜单栏图标：剩余%圆环 + 数字 ──
+    // ── 菜单栏图标：剩余%圆环，颜色=Hermes 状态 ──
     func setMenuBar(remainingPct pct: Int) {
-        guard let b = statusItem.button else { return }
-        b.image = ringImage(pct: pct)
-        b.imagePosition = .imageLeft
-        b.title = " \(pct)%"
+        lastPct = pct
+        lastAlpha = -1
+        renderRing()
     }
 
-    func ringImage(pct: Int) -> NSImage {
+    func ringImage(pct: Int, alpha: CGFloat = 1.0) -> NSImage {
+        let stateColor: NSColor
+        switch lightState {
+        case .idle:    stateColor = NSColor(calibratedRed: 0.13, green: 0.77, blue: 0.37, alpha: 1)
+        case .working: stateColor = NSColor(calibratedRed: 0.96, green: 0.62, blue: 0.04, alpha: 1)
+        case .waiting: stateColor = NSColor(calibratedRed: 0.94, green: 0.27, blue: 0.27, alpha: 1)
+        case .off:     stateColor = NSColor(calibratedRed: 0.61, green: 0.64, blue: 0.69, alpha: 1)
+        }
         let img = NSImage(size: NSSize(width: 16, height: 16), flipped: false) { _ in
             let c = NSPoint(x: 8, y: 8)
             let r: CGFloat = 5.5
-            NSColor(white: 0.0, alpha: 0.25).setStroke()
+            NSColor(white: 0.5, alpha: 0.3).setStroke()
             let track = NSBezierPath()
             track.appendArc(withCenter: c, radius: r, startAngle: 0, endAngle: 360)
             track.lineWidth = 2.2
             track.stroke()
-            NSColor.black.setStroke()
+            stateColor.withAlphaComponent(alpha).setStroke()
             let arc = NSBezierPath()
             arc.appendArc(withCenter: c, radius: r, startAngle: 90,
                           endAngle: 90 - 360 * CGFloat(pct) / 100, clockwise: true)
@@ -409,7 +652,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
             arc.stroke()
             return true
         }
-        img.isTemplate = true   // 自动适配深/浅色菜单栏
+        img.isTemplate = false   // 彩色状态环
         return img
     }
 }
